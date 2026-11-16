@@ -1,0 +1,704 @@
+// latex.fg — LaTeX para Fogu, sobre a lib Rust fogulatex via fogu:ffi.
+//
+// Compila documentos para PDF (ou DVI/XDV/HTML) com o motor TeX instalado
+// (tectonic, pdflatex, xelatex, lualatex, latexmk); se não houver nenhum,
+// install() baixa o Tectonic (um binário só, que busca os pacotes LaTeX sob
+// demanda) para tools/<plataforma>/. Lê o log (erros com arquivo e linha,
+// avisos), importa arquivos (`files`, `inputs`, \input) e bibliotecas
+// (.sty/.cls/.bib em `inputs`), converte PDF para PNG/SVG/TXT/PS com as
+// ferramentas que existirem e lê PDFs (páginas, metadados, texto).
+//
+// Os trabalhos demorados rodam em thread própria na lib e entregam eventos
+// (linhas de saída, passes, progresso) por callback (ffi.callback, Fogu 0.7+);
+// compile()/install()/convert() esperam em fatias, sem travar as tarefas fg.
+// Veja README.md.
+import { Native, Pump, ms } from "./_native.fg"
+import json from "fogu:json"
+import fs from "fogu:fs"
+import time from "fogu:time"
+
+const _native = new Native("latex", "fogulatex", "flx", {
+    flx_version: [["buffer", "i64"], "i64"],
+    flx_last_error: [["buffer", "i64"], "i64"],
+    flx_set_sink: [["ptr"], "i32"],
+    flx_tools: [["i32", "buffer", "i64"], "i64"],
+    flx_log_parse: [["str", "buffer", "i64"], "i64"],
+    flx_compile: [["str"], "i64"],
+    flx_install: [["str"], "i64"],
+    flx_convert: [["str"], "i64"],
+    flx_dispatch: [["i64", "i64", "i64", "ptr"], "i64"],
+    flx_result: [["i64", "buffer", "i64"], "i64"],
+    flx_cancel: [["i64"], "i32"],
+    flx_close: [["i64"], "i32"],
+    flx_pdf_info: [["str", "buffer", "i64"], "i64"],
+    flx_pdf_text: [["str", "str", "buffer", "i64"], "i64"],
+}, "FOGU_LATEX_LIB")
+const _f = _native.api
+
+// No import: reconhece o sistema e a arquitetura e já carrega o binário
+// certo (native/<so>-<arch>/...). Se faltar, o erro volta na primeira chamada.
+_native.autoload()
+
+let _last = nil
+
+// O que foi detectado e carregado: { platform, os, file, path, loaded, error }.
+export fn nativeInfo() { return _native.info() }
+
+// Carrega a biblioteca nativa (native/<plataforma>/fogulatex, native/fogulatex,
+// o build do cargo, ou FOGU_LATEX_LIB). `path` força um arquivo ou pasta.
+export fn load(path = nil) {
+    return _native.load(path)
+}
+
+// Caminho da lib carregada (nil antes de load()).
+export fn libraryPath() { return _native.path }
+
+export fn version() {
+    load()?
+    return _native.text((b, n) => _f.flx_version(b, n))
+}
+
+fn _status(rc) { return _native.status(rc) }
+
+// O resultado (evento done) da última compilação/conversão, mesmo quando
+// falhou: { ok, error, output, log, errors, warnings, passes, pages, ... }.
+export fn lastResult() { return _last }
+
+// ---- ferramentas -----------------------------------------------------------
+
+// { platform, tools_dir, engines: [{ name, path, version, source }], helpers, converters }.
+// withVersion = true roda --version em cada uma (mais lento).
+export fn tools(withVersion = false) {
+    load()?
+    let flag = 0
+    if withVersion { flag = 1 }
+    return _native.json((b, n) => _f.flx_tools(flag, b, n))
+}
+
+// Motores TeX encontrados, na ordem de preferência: [{ name, path, ... }].
+export fn engines() {
+    const t = tools()?
+    return t.engines, nil
+}
+
+// Nome do motor que compile() vai usar (tectonic, pdflatex...), ou nil.
+export fn engine() {
+    const list = engines()?
+    if len(list) == 0 { return nil, nil }
+    return list[0].name, nil
+}
+
+export fn hasEngine() {
+    const e = engine()?
+    return e != nil, nil
+}
+
+// Lê um log do TeX (texto): { errors: [{ message, file, line }], warnings, rerun, overfull, underfull }.
+export fn parseLog(text) {
+    load()?
+    return _native.json((b, n) => _f.flx_log_parse(str(text), b, n))
+}
+
+// ---- jobs ------------------------------------------------------------------
+
+// Um trabalho da lib (compilar, instalar, converter) rodando em thread
+// própria. events()/wait() recebem os eventos; o último é `done`.
+export struct Job {
+    handle = 0
+    kind = ""
+    done = nil
+    onEvent = nil
+    onOutput = nil
+    _pump = nil
+
+    new(handle, kind, onEvent = nil, onOutput = nil) {
+        this.handle = handle
+        this.kind = kind
+        this.onEvent = onEvent
+        this.onOutput = onOutput
+        this._pump = new Pump()
+    }
+
+    finished() { return this.done != nil }
+
+    // Até `max` eventos que chegarem em timeoutMs (duração ou ms; -1 = sem
+    // limite), esperando em fatias (as outras tarefas fg continuam rodando).
+    events(timeoutMs = 0, max = 64) {
+        if this.handle == 0 { return [], nil }
+        const h = this.handle
+        const evs = this._pump.wait(ms(timeoutMs),
+            (slice, cb) => _f.flx_dispatch(h, slice, max, cb),
+            () => _native.lastError(),
+            () => this.handle != 0)?
+        for ev in evs {
+            if ev["type"] == "done" { this.done = ev }
+        }
+        return evs, nil
+    }
+
+    // Espera o job terminar (até timeout; -1 = sem limite), entregando os
+    // eventos a onEvent(ev) e as linhas de saída a onOutput(line, ev).
+    // Devolve o evento done.
+    wait(timeout = -1) {
+        const limit = ms(timeout)
+        const deadline = time.monotonic() + float(limit) / 1000.0
+        while this.done == nil {
+            const evs = this.events(200)?
+            for ev in evs {
+                if this.onEvent != nil { this.onEvent(ev) }
+                if ev["type"] == "output" && this.onOutput != nil { this.onOutput(ev.line, ev) }
+            }
+            if limit >= 0 && this.done == nil && time.monotonic() >= deadline {
+                return nil, error(`latex: ${this.kind} não terminou em ${limit} ms`)
+            }
+        }
+        return this.done, nil
+    }
+
+    // O evento done se o job já terminou, senão nil (não espera).
+    result() {
+        if this.done != nil { return this.done, nil }
+        const s = _native.text((b, n) => _f.flx_result(this.handle, b, n))?
+        if s == "" { return nil, nil }
+        this.done = json.parse(s)?
+        return this.done, nil
+    }
+
+    // Mata o processo em execução.
+    cancel() { return _status(_f.flx_cancel(this.handle)) }
+
+    close() {
+        if this.handle == 0 { return true, nil }
+        const rc = _f.flx_close(this.handle)
+        this.handle = 0
+        this._pump.close()
+        return _status(rc)
+    }
+}
+
+// Roda um job até o fim e devolve o done; em falha devolve o erro (o done
+// fica em lastResult()).
+fn _runJob(kind, handle, options) {
+    if handle < 0 { return nil, _native.lastError() }
+    const job = new Job(handle, kind, options.get("onEvent"), options.get("onOutput"))
+    const [done, err] = job.wait(options.get("wait") ?? -1)
+    job.close()
+    if err != nil { return nil, err }
+    _last = done
+    if done.ok != true {
+        return nil, error(`latex: ${kind}: ${done.get("error") ?? "falhou"}`)
+    }
+    return done, nil
+}
+
+// ---- compilar --------------------------------------------------------------
+
+const _KEYS = {
+    jobname: "jobname", engine: "engine", outdir: "outdir", format: "format", passes: "passes",
+    maxPasses: "passes", bib: "bib", inputs: "inputs", files: "files", env: "env", args: "args",
+    shellEscape: "shell_escape", shell_escape: "shell_escape", synctex: "synctex",
+    haltOnError: "halt_on_error", halt_on_error: "halt_on_error", cacheDir: "cache_dir",
+    cache_dir: "cache_dir", onlyCached: "only_cached", only_cached: "only_cached",
+    untrusted: "untrusted", clean: "clean",
+}
+
+fn _compileOpts(options) {
+    const o = {}
+    for k, v in options {
+        const t = _KEYS.get(k)
+        if t != nil { o[t] = v }
+    }
+    const timeout = options.get("timeout") ?? options.get("timeout_ms")
+    if timeout != nil { o.timeout_ms = ms(timeout) }
+    return o
+}
+
+// Compila `source` (texto LaTeX) e devolve o resultado:
+//   { ok, output (caminho do PDF), log, engine, pages, passes, ms, errors, warnings, rerun, overfull }
+// options (todas opcionais; camelCase ou snake_case):
+//   engine        "tectonic" | "pdflatex" | "xelatex" | "lualatex" | "latexmk" | caminho (padrão: o primeiro instalado)
+//   outdir        pasta de saída ("out"); jobname: nome do PDF ("document")
+//   format        "pdf" (padrão) | "dvi" | "xdv" | "html" (tectonic)
+//   files         { "cap1.tex": "...", "refs.bib": "..." } — gravados na pasta do documento (para \input, \bibliography...)
+//   inputs        [pastas] com .sty/.cls/.bib/imagens — entram em TEXINPUTS/BIBINPUTS (ou -Z search-path no tectonic)
+//   bib           "auto" (roda bibtex/biber se o .aux pedir) | "bibtex" | "biber" | "none"
+//   passes        máximo de passes (4); haltOnError (true); shellEscape; synctex; clean (apaga .aux/.log...)
+//   timeout       por processo (5min); env { }; args [extra]; cacheDir/onlyCached/untrusted (tectonic)
+//   onOutput      (line, ev) => ... recebe cada linha do motor; onEvent(ev) todos os eventos
+// Em erro de compilação devolve o erro (com arquivo:linha) e o resultado
+// completo fica em lastResult().
+export fn compile(source, options = {}) {
+    load()?
+    const o = _compileOpts(options)
+    o.source = str(source)
+    return _runJob("compile", _f.flx_compile(json.stringify(o)), options)
+}
+
+// Compila um arquivo .tex (a pasta dele é a pasta de trabalho; outdir padrão = a mesma).
+export fn compileFile(file, options = {}) {
+    load()?
+    const o = _compileOpts(options)
+    o.file = str(file)
+    return _runJob("compile", _f.flx_compile(json.stringify(o)), options)
+}
+
+// Como compile(), mas devolve o Job sem esperar (use job.events()/wait()).
+export fn start(options = {}) {
+    load()?
+    const o = _compileOpts(options)
+    if options.has("source") { o.source = str(options.source) }
+    if options.has("file") { o.file = str(options.file) }
+    const handle = _f.flx_compile(json.stringify(o))
+    if handle < 0 { return nil, _native.lastError() }
+    return new Job(handle, "compile", options.get("onEvent"), options.get("onOutput")), nil
+}
+
+// ---- instalar o Tectonic ---------------------------------------------------
+
+// Baixa o Tectonic (https://tectonic-typesetting.github.io) para
+// tools/<plataforma>/ (ou options.dir) e devolve o caminho do executável.
+// options: version ("0.17.0"), dir, url, force, timeout, onProgress(ev) com
+// { bytes, total }. Na primeira compilação o Tectonic baixa os pacotes LaTeX
+// que o documento usa (precisa de internet; depois ficam no cache).
+export fn install(options = {}) {
+    load()?
+    const o = {}
+    for k in ["version", "dir", "url", "force"] {
+        if options.has(k) { o[k] = options[k] }
+    }
+    const timeout = options.get("timeout")
+    if timeout != nil { o.timeout_ms = ms(timeout) }
+    const onProgress = options.get("onProgress")
+    const opts = { onEvent: (ev) => {
+        if ev["type"] == "progress" && onProgress != nil { onProgress(ev) }
+        const cb = options.get("onEvent")
+        if cb != nil { cb(ev) }
+    } }
+    const done = _runJob("install", _f.flx_install(json.stringify(o)), opts)?
+    return done.path, nil
+}
+
+// Garante um motor: devolve o nome do instalado, ou baixa o Tectonic.
+export fn ensureEngine(options = {}) {
+    const e = engine()?
+    if e != nil { return e, nil }
+    install(options)?
+    return "tectonic", nil
+}
+
+// ---- PDF -------------------------------------------------------------------
+
+// { pages, version, size, title, author, subject, keywords, creator, producer, page_sizes: [[w, h] pt], encrypted }
+export fn pdfInfo(path) {
+    load()?
+    return _native.json((b, n) => _f.flx_pdf_info(str(path), b, n))
+}
+
+// Texto do PDF (páginas 1-based em `pages`; [] = todas), páginas separadas por "\f".
+export fn pdfText(path, pages = []) {
+    load()?
+    return _native.text((b, n) => _f.flx_pdf_text(str(path), json.stringify(pages), b, n))
+}
+
+// Converte um PDF com a ferramenta disponível (pdftoppm, mutool, gs, magick,
+// pdftocairo, dvisvgm, pdftotext...). options: to ("png" | "jpg" | "svg" |
+// "txt" | "ps"), outdir, prefix, dpi (150), pages [..], tool, timeout.
+// Devolve a lista de arquivos gerados.
+export fn convert(input, options = {}) {
+    load()?
+    const o = { input: str(input) }
+    for k in ["to", "outdir", "prefix", "dpi", "pages", "tool"] {
+        if options.has(k) { o[k] = options[k] }
+    }
+    const timeout = options.get("timeout")
+    if timeout != nil { o.timeout_ms = ms(timeout) }
+    const done = _runJob("convert", _f.flx_convert(json.stringify(o)), options)?
+    return done.files, nil
+}
+
+// Conversores de PDF encontrados: [{ name, path }].
+export fn converters() {
+    const t = tools()?
+    return t.converters, nil
+}
+
+// Há ferramenta para convert(..., { to }) gerar esse formato ("png", "jpg", "svg", "txt", "ps")?
+export fn canConvert(to) {
+    const t = tools()?
+    return len(t.formats.get(to) ?? []) > 0, nil
+}
+
+// ---- texto e documentos ----------------------------------------------------
+
+const _ESC = {}
+_ESC["\\"] = "\\textbackslash{}"
+_ESC["{"] = "\\{"
+_ESC["}"] = "\\}"
+_ESC["$"] = "\\$"
+_ESC["&"] = "\\&"
+_ESC["#"] = "\\#"
+_ESC["^"] = "\\textasciicircum{}"
+_ESC["_"] = "\\_"
+_ESC["%"] = "\\%"
+_ESC["~"] = "\\textasciitilde{}"
+
+// Escapa texto comum para LaTeX (\ { } $ & # ^ _ % ~).
+export fn escape(text) {
+    const out = []
+    for ch in str(text) { out.push(_ESC.get(ch) ?? ch) }
+    return out.join("")
+}
+
+// \cmd{arg}
+fn _cmd(name, arg) { return "\\" + name + "{" + arg + "}" }
+
+// Trechos LaTeX para usar dentro de raw(): referências, citações, notas...
+//   doc.raw(`Veja a tabela ${latex.ref("tab:compras")}${latex.footnote("Nota.")}.`)
+export fn ref(label) { return _cmd("ref", str(label)) }
+export fn pageref(label) { return _cmd("pageref", str(label)) }
+export fn cite(key) { return _cmd("cite", str(key)) }
+export fn footnote(text) { return _cmd("footnote", escape(text)) }
+export fn bold(text) { return _cmd("textbf", escape(text)) }
+export fn italic(text) { return _cmd("textit", escape(text)) }
+export fn mono(text) { return _cmd("texttt", escape(text)) }
+export fn url(address) { return _cmd("url", str(address)) }
+export fn href(address, text) { return "\\href{" + str(address) + "}{" + escape(text) + "}" }
+// \index{termo} (índice remissivo; requer index: true no Document). "termo!sub" cria um subitem.
+export fn indexEntry(term) { return _cmd("index", str(term)) }
+
+// Texto comum escapado, ou LaTeX cru quando começa com "\" (ex. "\today",
+// "\textbf{x}") — para title, author e date.
+fn _textOrTex(v) {
+    const s = str(v)
+    if s.starts_with("\\") { return s }
+    return escape(s)
+}
+
+// \cmd[opts]{arg}
+fn _cmdOpt(name, opts, arg) {
+    if opts == nil || opts == "" { return _cmd(name, arg) }
+    return "\\" + name + "[" + opts + "]{" + arg + "}"
+}
+
+// Um Document novo (o Fogu não permite `new modulo.Struct`; para usar `new
+// Document(...)` importe o struct: import { Document } from "./latex.fg").
+export fn document(options = {}) { return new Document(options) }
+
+// Códigos de idioma -> nome da língua no babel (hifenização, \today, "Capítulo",
+// "Tabela"...). Outros valores são passados ao babel como estão ("ngerman").
+const _BABEL = {
+    "pt-BR": "brazil", "pt-br": "brazil", "br": "brazil", "brazil": "brazil",
+    "pt-PT": "portuguese", "pt-pt": "portuguese", "pt": "portuguese", "portuguese": "portuguese", "portuges": "portuguese",
+    "en": "english", "en-US": "american", "en-GB": "british",
+    "es": "spanish", "fr": "french", "de": "ngerman", "it": "italian", "nl": "dutch",
+}
+
+// Nome babel de um código de idioma ("pt-BR" -> "brazil", "pt-PT" -> "portuguese").
+export fn babelName(lang) { return _BABEL.get(str(lang)) ?? str(lang) }
+
+// Monta um documento LaTeX por partes e compila. Texto comum passa por
+// escape(); raw() e preamble() entram como estão.
+//   const doc = latex.document({ class: "article", packages: ["graphicx", ["geometry", "margin=2cm"]], title: "Relatório" })
+//   doc.section("Introdução").text("Olá, 100% Fogu & LaTeX.").input("cap1")
+//   const r = doc.compile({ outdir: "out", jobname: "relatorio", files: { "cap1.tex": "..." } })?
+export struct Document {
+    class = "article"
+    classOptions = ""
+    title = nil
+    author = nil
+    date = nil
+    _packages = nil
+    _preamble = nil
+    _body = nil
+
+    index = false
+    hyperref = nil
+
+    // options:
+    //   class         "article" (padrão), "report"/"book" (com chapter()), "beamer"...; classOptions "a4paper,12pt"
+    //   lang          "pt-BR" | "pt-PT" | "en" | ... -> \usepackage[<língua>]{babel}; lista = várias, a última é a principal
+    //   packages      ["graphicx", ["geometry", "margin=2cm"]]
+    //   title, author, date   texto escapado, ou LaTeX cru se começar com "\" (date: "\\today"; date: "" tira a data)
+    //   hyperref      true ou { colorlinks: true, ... } -> \usepackage[hidelinks,pdftitle=...]{hyperref} (links no sumário, \url, \href, título no PDF)
+    //   index         true -> \usepackage{makeidx}\makeindex; use indexEntry() no texto e printIndex() no fim
+    //   preamble      texto cru no preâmbulo
+    new(options = {}) {
+        this.class = options.get("class") ?? "article"
+        this.classOptions = options.get("classOptions") ?? ""
+        this.title = options.get("title")
+        this.author = options.get("author")
+        this.date = options.get("date")
+        this.index = options.get("index") ?? false
+        this.hyperref = options.get("hyperref")
+        this._packages = []
+        this._preamble = []
+        this._body = []
+        const lang = options.get("lang")
+        if lang != nil {
+            let langs = lang
+            if typeof(lang) != "list" { langs = [lang] }
+            this.usePackage("babel", langs.map(babelName).join(","))
+        }
+        for p in options.get("packages") ?? [] {
+            if typeof(p) == "list" { this.usePackage(p[0], p[1]) } else { this.usePackage(p) }
+        }
+        if this.index { this.usePackage("makeidx").preamble("\\makeindex") }
+        const pre = options.get("preamble")
+        if pre != nil { this._preamble.push(str(pre)) }
+    }
+
+    // \usepackage[...]{hyperref}, sempre por último (como o hyperref pede), com o
+    // título e o autor do documento nos metadados do PDF.
+    _hyperref() {
+        if this.hyperref == nil || this.hyperref == false { return nil }
+        const opts = ["hidelinks"]
+        if typeof(this.hyperref) == "map" {
+            for k, v in this.hyperref {
+                if v == true { opts.push(k) } else if v != false && v != nil { opts.push(k + "=" + str(v)) }
+            }
+        }
+        if this.title != nil && !this.title.starts_with("\\") { opts.push("pdftitle={" + escape(this.title) + "}") }
+        if this.author != nil && !this.author.starts_with("\\") { opts.push("pdfauthor={" + escape(this.author) + "}") }
+        return _cmdOpt("usepackage", opts.join(","), "hyperref")
+    }
+
+    // ---- estrutura ----
+
+    // \tableofcontents (sumário/índice de capítulos e seções; a lib roda os passes extras).
+    toc() {
+        this._body.push("\\tableofcontents")
+        return this
+    }
+
+    listOfFigures() {
+        this._body.push("\\listoffigures")
+        return this
+    }
+
+    listOfTables() {
+        this._body.push("\\listoftables")
+        return this
+    }
+
+    // \part{title} (book/report) — starred = sem numeração.
+    part(title, starred = false) {
+        let name = "part"
+        if starred { name = "part*" }
+        this._body.push(_cmd(name, escape(title)))
+        return this
+    }
+
+    // \chapter{title} (classes report e book; em article vira \section).
+    chapter(title, starred = false) {
+        if this.class != "report" && this.class != "book" && this.class != "memoir" && this.class != "scrreprt" && this.class != "scrbook" {
+            return this.section(title, 1, starred)
+        }
+        let name = "chapter"
+        if starred { name = "chapter*" }
+        this._body.push(_cmd(name, escape(title)))
+        return this
+    }
+
+    // \begin{abstract} ... \end{abstract} (resumo; texto escapado).
+    abstract(text) { return this.env("abstract", escape(text)) }
+
+    // \appendix: daqui em diante os capítulos/seções são apêndices (A, B...).
+    appendix() {
+        this._body.push("\\appendix")
+        return this
+    }
+
+    // \label{name} logo após a seção/figura/tabela anterior; use latex.ref(name) em raw().
+    label(name) {
+        this._body.push(_cmd("label", str(name)))
+        return this
+    }
+
+    // \printindex (índice remissivo; requer index: true e indexEntry() no texto).
+    printIndex() {
+        this._body.push("\\printindex")
+        return this
+    }
+
+    // Código tal e qual (verbatim).
+    code(text) {
+        this._body.push("\\begin{verbatim}\n" + str(text) + "\n\\end{verbatim}")
+        return this
+    }
+
+    // Citação em bloco (texto escapado).
+    quote(text) { return this.env("quote", escape(text)) }
+
+    // Conteúdo cru centralizado.
+    center(tex) { return this.env("center", str(tex)) }
+
+    // Espaço vertical: "1cm", "2em"...
+    vspace(length) {
+        this._body.push(_cmd("vspace", str(length)))
+        return this
+    }
+
+    // Linha horizontal.
+    rule() {
+        this._body.push("\\noindent\\rule{\\textwidth}{0.4pt}")
+        return this
+    }
+
+    pageBreak() { return this.newpage() }
+
+    // \usepackage[opts]{name}
+    usePackage(name, opts = nil) {
+        this._packages.push(_cmdOpt("usepackage", opts, name))
+        return this
+    }
+
+    // Linha no preâmbulo (antes de \begin{document}), sem escape.
+    preamble(tex) {
+        this._preamble.push(str(tex))
+        return this
+    }
+
+    // LaTeX cru no corpo.
+    raw(tex) {
+        this._body.push(str(tex))
+        return this
+    }
+
+    // Texto comum (escapado); cada chamada é um parágrafo.
+    text(s) {
+        this._body.push(escape(s) + "\n")
+        return this
+    }
+
+    // \section (level 1), \subsection (2), \subsubsection (3), \paragraph (4). starred = sem numeração.
+    section(title, level = 1, starred = false) {
+        const names = ["section", "subsection", "subsubsection", "paragraph"]
+        let idx = level - 1
+        if idx < 0 { idx = 0 }
+        if idx > 3 { idx = 3 }
+        let name = names[idx]
+        if starred { name = name + "*" }
+        this._body.push(_cmd(name, escape(title)))
+        return this
+    }
+
+    // \begin{env}[opts] ... \end{env} com o conteúdo (cru).
+    env(name, content, opts = nil) {
+        let open = "\\begin{" + name + "}"
+        if opts != nil && opts != "" { open = open + "[" + opts + "]" }
+        this._body.push(open + "\n" + str(content) + "\n\\end{" + name + "}")
+        return this
+    }
+
+    itemize(items) { return this._list("itemize", items) }
+    enumerate(items) { return this._list("enumerate", items) }
+
+    _list(kind, items) {
+        const lines = []
+        for it in items { lines.push("  \\item " + escape(it)) }
+        return this.env(kind, lines.join("\n"))
+    }
+
+    // Tabela: rows = lista de listas (células escapadas; use raw: true para
+    // LaTeX nas células). options: header (true: a 1ª linha em negrito com
+    // \hline), align ("lcr"; padrão: tudo "l"), caption, label, booktabs (false).
+    table(rows, options = {}) {
+        if len(rows) == 0 { return this }
+        const cols = len(rows[0])
+        let align = options.get("align")
+        if align == nil { align = "l".repeat(cols) }
+        const header = options.get("header") ?? true
+        const rawCells = options.get("raw") ?? false
+        const cell = (c) => {
+            if rawCells { return str(c) }
+            return escape(c)
+        }
+        const lines = ["\\begin{tabular}{" + align + "}", "\\hline"]
+        for i, row in rows {
+            let cells = row.map(cell)
+            if header && i == 0 { cells = cells.map((c) => _cmd("textbf", c)) }
+            lines.push(cells.join(" & ") + " \\\\")
+            if header && i == 0 { lines.push("\\hline") }
+        }
+        lines.push("\\hline")
+        lines.push("\\end{tabular}")
+        let body = lines.join("\n")
+        const caption = options.get("caption")
+        if caption != nil || options.has("label") {
+            let extra = "\\centering\n" + body
+            if caption != nil { extra = extra + "\n" + _cmd("caption", escape(caption)) }
+            if options.has("label") { extra = extra + "\n" + _cmd("label", options.label) }
+            return this.env("table", extra, options.get("placement") ?? "htbp")
+        }
+        this._body.push(body)
+        return this
+    }
+
+    // \includegraphics[width=...]{path} (requer graphicx). options: width ("0.8\textwidth"), caption, label.
+    image(path, options = {}) {
+        const width = options.get("width") ?? "0.8\\textwidth"
+        const inc = _cmdOpt("includegraphics", "width=" + width, str(path))
+        const caption = options.get("caption")
+        if caption != nil || options.has("label") {
+            let extra = "\\centering\n" + inc
+            if caption != nil { extra = extra + "\n" + _cmd("caption", escape(caption)) }
+            if options.has("label") { extra = extra + "\n" + _cmd("label", options.label) }
+            return this.env("figure", extra, options.get("placement") ?? "htbp")
+        }
+        this._body.push(inc)
+        return this
+    }
+
+    // Matemática: $expr$ ou, com display = true, \[ expr \].
+    math(expr, display = false) {
+        if display { this._body.push("\\[ " + str(expr) + " \\]") } else { this._body.push("$" + str(expr) + "$") }
+        return this
+    }
+
+    // \input{file} — importa outro .tex (da pasta do documento ou de `inputs`).
+    input(file) {
+        this._body.push(_cmd("input", str(file)))
+        return this
+    }
+
+    // \include{file} (começa em página nova).
+    include(file) {
+        this._body.push(_cmd("include", str(file)))
+        return this
+    }
+
+    newpage() {
+        this._body.push("\\newpage")
+        return this
+    }
+
+    // \bibliographystyle{style} + \bibliography{file} (bibtex).
+    bibliography(file, style = "plain") {
+        this._body.push(_cmd("bibliographystyle", style))
+        this._body.push(_cmd("bibliography", str(file)))
+        return this
+    }
+
+    // O texto LaTeX completo.
+    build() {
+        const out = [_cmdOpt("documentclass", this.classOptions, this.class)]
+        for p in this._packages { out.push(p) }
+        const hyper = this._hyperref()
+        if hyper != nil { out.push(hyper) }
+        for p in this._preamble { out.push(p) }
+        if this.title != nil { out.push(_cmd("title", _textOrTex(this.title))) }
+        if this.author != nil { out.push(_cmd("author", _textOrTex(this.author))) }
+        if this.date != nil { out.push(_cmd("date", _textOrTex(this.date))) }
+        out.push("\\begin{document}")
+        if this.title != nil { out.push("\\maketitle") }
+        for b in this._body { out.push(b) }
+        out.push("\\end{document}")
+        return out.join("\n") + "\n"
+    }
+
+    // Grava o .tex.
+    save(path) { return fs.writeText(str(path), this.build()) }
+
+    // Compila (as mesmas options de latex.compile).
+    compile(options = {}) { return compile(this.build(), options) }
+}

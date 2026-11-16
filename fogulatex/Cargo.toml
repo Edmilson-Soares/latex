@@ -1,0 +1,20 @@
+[package]
+name = "fogulatex"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = "1"
+lopdf = "0.47"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

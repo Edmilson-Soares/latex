@@ -1,0 +1,113 @@
+// Exemplo: monta um relatório com o Document — seções, tabela, lista, fórmula,
+// imagem gerada com fogu:image e importada de uma pasta (`inputs`), um
+// capítulo importado (\input de um arquivo passado em `files`) e um pacote
+// próprio (.sty em `inputs`) — gera out/relatorio.pdf, lê o PDF e, se houver
+// conversor, gera PNGs. Sem motor TeX instalado, baixa o Tectonic para tools/.
+//   fogu run build:native && fogu run main.fg
+import latex from "./latex.fg"
+import fs from "fogu:fs"
+import image from "fogu:image"
+
+// Uma imagem para importar no PDF (qualquer PNG/JPG/PDF serve).
+fn makeLogo(path) {
+    const img = image.new(400, 200, "#1e293b")
+    img.rect(20, 20, 160, 160, { fill: "#f97316", radius: 24 })
+    img.circle(300, 100, 70, { stroke: "white", width: 6 })
+    img.text("Fogu", 200, 150, { size: 48, color: "white" })
+    return img.save(path)
+}
+
+fn main() {
+    print(`fogulatex ${latex.version()?}`)
+    const t = latex.tools()?
+    if len(t.engines) == 0 {
+        print(`nenhum motor TeX encontrado; baixando o Tectonic para ${t.tools_dir}...`)
+        latex.install({ onProgress: (ev) => {
+            if ev.total > 0 { print(`  ${int(ev.bytes / 1024)} / ${int(ev.total / 1024)} KB`) }
+        } })?
+    }
+    print(`motor: ${latex.engine()?}`)
+
+    // Uma "lib" própria (pacote .sty) e uma imagem, em pastas passadas em inputs.
+    fs.mkdir("libs")
+    fs.mkdir("images")
+    fs.writeText("libs/fogustyle.sty", "\\ProvidesPackage{fogustyle}\n\\newcommand{\\fogu}{\\textbf{Fogu}}\n")?
+    makeLogo("images/logo.png")?
+
+    const doc = latex.document({
+        class: "report", // capítulos; "article" para seções apenas
+        classOptions: "a4paper,12pt",
+        // lang: hifenização e \today no idioma: "pt-BR" (brazil) ou "pt-PT" (portuguese).
+        // Uma lista ativa várias línguas no babel; a última é a principal.
+        lang: ["pt-PT", "pt-BR"],
+        packages: ["graphicx", ["geometry", "margin=2.5cm"], "fogustyle"],
+        title: "Relatório gerado pelo Fogu",
+        author: "fogulatex",
+        date: "\\today",
+        hyperref: true, // links no sumário e título/autor nos metadados do PDF
+        index: true, // índice remissivo (indexEntry() + printIndex())
+    })
+    doc.abstract("Um documento com sumário, capítulos, tabela, lista, fórmula, imagem, arquivo importado, pacote próprio e índice remissivo.")
+        .toc()
+        .listOfFigures()
+        .listOfTables()
+        .chapter("Introdução")
+        .label("cap:intro")
+        .text("Este PDF foi gerado por um programa Fogu, com LaTeX. Caracteres especiais como 100%, R$ 5 & #1 são escapados.")
+        .raw(`Comandos do pacote próprio funcionam: \\fogu${latex.indexEntry("Fogu")}${latex.footnote("Definido em libs/fogustyle.sty.")}.`)
+        .section("Dados")
+        .table([["Item", "Quantidade", "Preço"], ["Café", "2", "R$ 9,50"], ["Pão", "6", "R$ 4,00"]], { caption: "Compras", label: "tab:compras", align: "lrr" })
+        .raw(`A Tabela ${latex.ref("tab:compras")} está na página ${latex.pageref("tab:compras")}${latex.indexEntry("tabela")}.`)
+        .itemize(["primeiro ponto", "segundo ponto"])
+        .math("E = mc^2", true)
+        .section("Imagem importada")
+        .image("logo.png", { width: "6cm", caption: "Gerada com fogu:image e importada da pasta images/", label: "fig:logo" })
+        .chapter("Capítulo importado")
+        .raw(`Veja o Capítulo ${latex.ref("cap:intro")}${latex.indexEntry("LaTeX!input")}.`)
+        .input("cap1")
+        .code("const r = doc.compile({ outdir: \"out\" })?")
+        .appendix()
+        .chapter("Apêndice")
+        .text("Capítulos depois de appendix() viram A, B, C.")
+        .printIndex()
+
+    const result = doc.compile({
+        outdir: "out",
+        jobname: "relatorio",
+        inputs: ["libs", "images"],
+        files: { "cap1.tex": "Este texto veio do arquivo \\texttt{cap1.tex}, importado com \\verb|\\input|. Ele começa numa página nova por causa do \\verb|newpage()|.\n" },
+        onOutput: (line, _ev) => {
+            if line.starts_with("!") || line.contains("Warning") { print(`  ${line}`) }
+        },
+    })
+    const [r, err] = result
+    if err != nil {
+        print(`erro: ${err.message}`)
+        const last = latex.lastResult()
+        if last != nil {
+            for e in last.errors { print(`  ${e.get("file") ?? ""}:${e.get("line") ?? "?"}: ${e.message}`) }
+            if last.log != nil { print(`  log: ${last.log}`) }
+        }
+        return true, nil
+    }
+    print(`PDF: ${r.output} (${r.pages} página(s), ${r.passes} passe(s) do ${r.engine}, ${r.ms} ms)`)
+    for w in r.warnings { print(`  aviso: ${w.message}`) }
+
+    const info = latex.pdfInfo(r.output)?
+    print(`título no PDF: ${info.title}, produzido por ${info.producer}`)
+    const text = latex.pdfText(r.output, [2])?
+    let cut = len(text)
+    if cut > 80 { cut = 80 }
+    print(`texto da 2ª página (sumário): ${text.slice(0, cut)}...`)
+
+    if latex.canConvert("png")? {
+        const files = latex.convert(r.output, { to: "png", dpi: 100, outdir: "out" })?
+        print(`PNG: ${files.join(", ")}`)
+    } else {
+        print("nenhum conversor (pdftoppm, mutool, gs, magick) encontrado; pulando PNG")
+    }
+    return true, nil
+}
+
+const [_ok, err] = main()
+if err != nil { print(`erro: ${err.message}`) }

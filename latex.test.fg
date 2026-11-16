@@ -1,0 +1,140 @@
+// Testes do latex.fg. Precisam da lib nativa (fogu run build:native).
+// Os que compilam de verdade são pulados se não houver motor TeX instalado
+// (latex.install() baixa o Tectonic; o teste não baixa nada sozinho).
+//   fogu test
+import { test, skip, expect } from "fogu:test"
+import latex from "./latex.fg"
+import fs from "fogu:fs"
+import path from "fogu:path"
+import time from "fogu:time"
+
+fn tempDir(name) {
+    const d = path.join(fs.tempDir(), `fogulatex-${name}-${time.now()}`)
+    fs.mkdir(d)
+    return d
+}
+
+test("carrega a lib nativa", (): error => {
+    expect(latex.version()?).toBe("0.1.0")
+    const t = latex.tools()?
+    expect(typeof(t.engines)).toBe("list")
+    expect(t.platform.contains("-")).toBe(true)
+    return nil
+})
+
+test("escape e Document.build", (): error => {
+    expect(latex.escape("100% & R$ 5 #1 a_b {x} ~ ^ \\")).toBe("100\\% \\& R\\$ 5 \\#1 a\\_b \\{x\\} \\textasciitilde{} \\textasciicircum{} \\textbackslash{}")
+    const doc = latex.document({ class: "article", classOptions: "a4paper", packages: ["graphicx", ["geometry", "margin=2cm"]], title: "Olá & tchau", author: "\\textsc{Fogu}", date: "\\today" })
+    doc.section("Intro").text("50% off").input("cap1").itemize(["a", "b_c"]).table([["x", "y"], ["1", "2"]], { align: "lr" }).math("x^2", true)
+    const tex = doc.build()
+    expect(tex.starts_with("\\documentclass[a4paper]{article}\n\\usepackage{graphicx}\n\\usepackage[margin=2cm]{geometry}\n")).toBe(true)
+    expect(tex).toContain("\\title{Olá \\& tchau}")
+    expect(tex).toContain("\\author{\\textsc{Fogu}}\n\\date{\\today}\n")
+    expect(tex).toContain("\\maketitle")
+    expect(latex.document({ title: "T", date: "" }).build()).toContain("\\date{}")
+    expect(latex.document({ lang: "pt-BR" }).build()).toContain("\\usepackage[brazil]{babel}")
+    expect(latex.document({ lang: ["pt-PT", "en"] }).build()).toContain("\\usepackage[portuguese,english]{babel}")
+    expect(latex.babelName("pt-PT")).toBe("portuguese")
+    expect(latex.babelName("ngerman")).toBe("ngerman")
+
+    // Estrutura: sumário, capítulos, apêndice, índice, hyperref, trechos.
+    const rep = latex.document({ class: "report", title: "Livro & Cia", author: "Eu", hyperref: { colorlinks: true }, index: true })
+    rep.toc().listOfFigures().abstract("Resumo 100%").chapter("Um").label("cap:um").section("Sec").text("x")
+        .raw(`Veja ${latex.ref("cap:um")}${latex.footnote("nota & tal")} e ${latex.indexEntry("Fogu!FFI")}.`)
+        .code("let x = 1 % 2").quote("Dito.").appendix().chapter("Extra").printIndex()
+    const t2 = rep.build()
+    expect(t2).toContain("\\usepackage{makeidx}\n\\usepackage[hidelinks,colorlinks,pdftitle={Livro \\& Cia},pdfauthor={Eu}]{hyperref}\n\\makeindex\n")
+    expect(t2).toContain("\\tableofcontents\n\\listoffigures\n\\begin{abstract}\nResumo 100\\%\n\\end{abstract}\n\\chapter{Um}\n\\label{cap:um}\n\\section{Sec}")
+    expect(t2).toContain("Veja \\ref{cap:um}\\footnote{nota \\& tal} e \\index{Fogu!FFI}.")
+    expect(t2).toContain("\\begin{verbatim}\nlet x = 1 % 2\n\\end{verbatim}\n\\begin{quote}\nDito.\n\\end{quote}\n\\appendix\n\\chapter{Extra}\n\\printindex")
+    expect(latex.document({}).chapter("A").build()).toContain("\\section{A}")
+    expect(latex.href("https://x.y", "a_b")).toBe("\\href{https://x.y}{a\\_b}")
+    expect(tex).toContain("\\section{Intro}\n50\\% off\n")
+    expect(tex).toContain("\\input{cap1}")
+    expect(tex).toContain("\\begin{itemize}\n  \\item a\n  \\item b\\_c\n\\end{itemize}")
+    expect(tex).toContain("\\begin{tabular}{lr}\n\\hline\n\\textbf{x} & \\textbf{y} \\\\\n\\hline\n1 & 2 \\\\\n\\hline\n\\end{tabular}")
+    expect(tex).toContain("\\[ x^2 \\]")
+    expect(tex.ends_with("\\end{document}\n")).toBe(true)
+    return nil
+})
+
+test("lê um log do TeX", (): error => {
+    const r = latex.parseLog("./main.tex:12: Undefined control sequence.\nl.12 \\foo\nLaTeX Warning: Reference `x' undefined on input line 3.\nLaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.\n")?
+    expect(len(r.errors)).toBe(1)
+    expect(r.errors[0].line).toBe(12)
+    expect(r.errors[0].file).toBe("./main.tex")
+    expect(len(r.warnings)).toBe(2)
+    expect(r.warnings[0].line).toBe(3)
+    expect(r.rerun).toBe(true)
+    return nil
+})
+
+test("compile sem motor ou arquivo devolve erro claro", (): error => {
+    const [_r, err] = latex.compileFile("nao-existe.tex")
+    expect(err != nil).toBe(true)
+    const last = latex.lastResult()
+    expect(last.ok).toBe(false)
+    expect(typeof(last.error)).toBe("str")
+    const [_c, cerr] = latex.convert("nao-existe.pdf", { to: "png" })
+    expect(cerr.message).toContain("não encontrado")
+    return nil
+})
+
+let withEngine = skip
+if latex.hasEngine()? { withEngine = test }
+
+withEngine("compila um documento com \\input, pacote próprio e lê o PDF", (): error => {
+    const dir = tempDir("compile")
+    const libs = path.join(dir, "libs")
+    fs.mkdir(libs)
+    fs.writeText(path.join(libs, "fogustyle.sty"), "\\ProvidesPackage{fogustyle}\n\\newcommand{\\fogu}{\\textbf{Fogu}}\n")?
+    // report com sumário, capítulos, referência cruzada e índice remissivo
+    // (gerado pelo makeindex interno quando não há makeindex): precisa de
+    // passes extras, que a lib faz sozinha.
+    const doc = latex.document({ class: "report", packages: ["fogustyle"], title: "Teste fogulatex", hyperref: true, index: true })
+    doc.toc().chapter("Um").label("cap:um").section("Olá").text("Olá 100%.").raw("\\fogu")
+        .raw(`Entrada ${latex.indexEntry("Fogu")}${latex.indexEntry("FFI")} e referência ${latex.ref("cap:um")}.`)
+        .chapter("Dois").input("cap1").printIndex()
+    const lines = []
+    const r = doc.compile({
+        outdir: path.join(dir, "out"),
+        jobname: "teste",
+        inputs: [libs],
+        files: { "cap1.tex": "Texto do capítulo importado.\n" },
+        onOutput: (line, _ev) => { lines.push(line) },
+    })?
+    expect(r.ok).toBe(true)
+    expect(r.pages >= 4).toBe(true)
+    expect(r.output.ends_with("teste.pdf")).toBe(true)
+    expect(fs.isFile(r.output)).toBe(true)
+    expect(len(lines) > 0).toBe(true)
+    expect(len(r.errors)).toBe(0)
+    expect(r.tools.contains("makeindex") || r.tools.contains("mkindex")).toBe(true)
+    const info = latex.pdfInfo(r.output)?
+    expect(info.pages).toBe(r.pages)
+    expect(info.title).toBe("Teste fogulatex")
+    const text = latex.pdfText(r.output)?
+    expect(text).toContain("Teste fogulatex")
+    expect(text).toContain("importado")
+    expect(text).toContain("Contents")
+    expect(text).toContain("Chapter 2 Dois")
+    expect(text).toContain("Index")
+    expect(text).toContain("FFI")
+    expect(text).toContain("referência")
+
+    // Erro com linha.
+    const [_bad, err] = latex.compile("\\documentclass{article}\n\\begin{document}\n\\foo\n\\end{document}\n", { outdir: path.join(dir, "out"), jobname: "erro" })
+    expect(err != nil).toBe(true)
+    expect(err.message).toContain("Undefined control sequence")
+    const last = latex.lastResult()
+    expect(last.ok).toBe(false)
+    expect(last.errors[0].line).toBe(3)
+
+    // Conversão, se houver conversor.
+    if latex.canConvert("png")? {
+        const files = latex.convert(r.output, { to: "png", dpi: 50, outdir: path.join(dir, "png") })?
+        expect(len(files)).toBe(1)
+    }
+    fs.removeAll(dir)
+    return nil
+})
