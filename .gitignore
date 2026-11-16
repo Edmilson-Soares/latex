@@ -13,9 +13,8 @@ dist/
 .DS_Store
 Thumbs.db
 
-# fogulatex (lib Rust), biblioteca gerada e motor TeX baixado (tools/) e saídas
+# fogulatex (lib Rust), motor TeX baixado (tools/) e saídas
 fogulatex/target/
-native/
 tools/
 out/
 images/
